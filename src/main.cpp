@@ -28,8 +28,7 @@ using namespace std;
 #define GYROZ_THRESHOLD_FOR_ROTATION_START 600
 #define ANGLE_CHECK_RANGE 3
 #define ANGLE_CHECK_STRIDE 1
-#define DISTANCE_SENSOR_RELATIVE_WEIGHT 0.5
-#define IS_BEACON_ACTIVE true
+#define DISTANCE_SENSOR_RELATIVE_WEIGHT 1
 
 std::vector<int> howManyTimesEachAngleWasMeasured(360, 0);
 std::vector<int> mapping(360, 0);
@@ -99,7 +98,7 @@ void setup()
     Serial.println(F("Done!\n"));
     // ==========================================================================================
 
-    char freq_packet[] = {0x5A, 0x06, 0x03, 0xFA, 0x00, 0x00}; // set TF-Luna freq to 250 Hz (0xFA=250)
+    char freq_packet[] = {0x5A, 0x06, 0x03, 0xFA, 0x00, 0x00}; // set TF-Luna freq to 250 Hz (0xFA=0d250)
     Serial2.write(freq_packet, (size_t)6);
 
     digitalWrite(BUILT_IN_LED, LOW);
@@ -109,8 +108,6 @@ double currentAngleZOffset = 0;
 
 bool mappingCompletedFlag = true;
 unsigned long prevMillisOfDistanceSample = 0;
-unsigned long prevMillisOfDistanceSample2 = 0;
-unsigned long prevMillisOfGyroSample;
 unsigned long prevMillisOfMapping = 0;
 
 vector<int> timestampVectorForLog;
@@ -121,7 +118,7 @@ vector<int> estimatedAngleVectorForLog;
 int rotationStartTimestamp = 0;
 bool wasRotationSaved = false;
 
-double currentEstimatedAngle = 0;
+int currentEstimatedAngle = 0;
 
 bool hasBegunRotation = false;
 
@@ -235,10 +232,10 @@ void loop()
     if (currentLunaDistance < 20)
     {
         digitalWrite(LED_PIN, LOW);
-        if ((millis() - prevMillisOfDistanceSample2) >= 20)
+        if ((millis() - prevMillisOfDistanceSample) >= 20)
         {
             currentAngleZOffset += getGyroYaw();
-            prevMillisOfDistanceSample2 = millis();
+            prevMillisOfDistanceSample = millis();
         }
     }
     else
@@ -338,10 +335,6 @@ int estimateCurrentAngle()
     if (!isFirstTimeEstimating)
     {
         currentEstimatedAngleBasedOnSpeedPropagation = (int(previousEstimatedAngle + ((millis() - previousEstimationTimestamp) / 1000.0) * mpu.getGyroZ())) % 360;
-        if ((samplesBuffer.back() <= (mapping.at(0) + 10)) && IS_BEACON_ACTIVE)
-        {
-            currentEstimatedAngleBasedOnSpeedPropagation = 0;
-        }
     }
     previousEstimationTimestamp = millis();
 
