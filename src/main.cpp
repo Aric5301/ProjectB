@@ -378,7 +378,14 @@ int estimateCurrentAngle()
         }
     }
 
-    currentEstimatedAngle = DISTANCE_SENSOR_RELATIVE_WEIGHT * currentEstimatedAngle + (1 - DISTANCE_SENSOR_RELATIVE_WEIGHT) * currentEstimatedAngleBasedOnSpeedPropagation;
+    if (abs(currentEstimatedAngle - currentEstimatedAngleBasedOnSpeedPropagation) >= 180)
+    {
+        currentEstimatedAngle = (DISTANCE_SENSOR_RELATIVE_WEIGHT * (currentEstimatedAngle + 360) + (1 - DISTANCE_SENSOR_RELATIVE_WEIGHT) * currentEstimatedAngleBasedOnSpeedPropagation) % 360;
+    }
+    else
+    {
+        currentEstimatedAngle = DISTANCE_SENSOR_RELATIVE_WEIGHT * currentEstimatedAngle + (1 - DISTANCE_SENSOR_RELATIVE_WEIGHT) * currentEstimatedAngleBasedOnSpeedPropagation;
+    }
     previousEstimatedAngle = currentEstimatedAngle;
     return currentEstimatedAngle;
 }
