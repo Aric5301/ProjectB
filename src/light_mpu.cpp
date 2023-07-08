@@ -2,11 +2,7 @@
 //     Angles are given in degrees
 //  License: MIT
 //  */
-// #include "Wire.h"
-// #include <MPU6050_light.h>
-// #include <cmath>
 
-// #include "Adafruit_VL53L0X.h"
 // #include "Wire.h"
 // #include <MPU6050_light.h>
 // #include <cmath>
