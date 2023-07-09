@@ -7,6 +7,7 @@
 #include <queue>
 #include <vector>
 #include <sstream>
+#include <algorithm>
 
 #include "FS.h"
 #include "SPIFFS.h"
@@ -380,7 +381,14 @@ int estimateCurrentAngle()
 
     if (abs(currentEstimatedAngle - currentEstimatedAngleBasedOnSpeedPropagation) >= 180)
     {
-        currentEstimatedAngle = (DISTANCE_SENSOR_RELATIVE_WEIGHT * (currentEstimatedAngle + 360) + (1 - DISTANCE_SENSOR_RELATIVE_WEIGHT) * currentEstimatedAngleBasedOnSpeedPropagation) % 360;
+        if (currentEstimatedAngle < currentEstimatedAngleBasedOnSpeedPropagation)
+        {
+            currentEstimatedAngle = (DISTANCE_SENSOR_RELATIVE_WEIGHT * (currentEstimatedAngle + 360) + (1 - DISTANCE_SENSOR_RELATIVE_WEIGHT) * currentEstimatedAngleBasedOnSpeedPropagation) % 360;
+        }
+        else
+        {
+            currentEstimatedAngle = (DISTANCE_SENSOR_RELATIVE_WEIGHT * currentEstimatedAngle + (1 - DISTANCE_SENSOR_RELATIVE_WEIGHT) * (currentEstimatedAngleBasedOnSpeedPropagation + 360)) % 360;
+        }
     }
     else
     {
