@@ -26,33 +26,30 @@ using namespace std;
 // Algorithm parameters:
 
 // change this to choose whether you want the main algorithm active or only the beacon algorithm active.
-// In practice, the difference is that you will have to perform mapping when the system boots
 #define IS_ALGORITHM_USED true
 
+#define SHOULD_PRINT_PREV_LOG_ON_BOOT true
+
+#define MAPPING_BUFFER_SIZE 3
 #define SAMPLE_BUFFER_SIZE 30
-#define SETTLE_TIME 500 // ms
-#define GYROZ_THRESHOLD_FOR_ROTATION_START 600
-#define ANGLE_CHECK_RANGE 6
-#define ANGLE_CHECK_STRIDE 2
-#define DISTANCE_SENSOR_RELATIVE_WEIGHT 0
+#define SETTLE_TIME 0.5                        // seconds
+#define GYROZ_THRESHOLD_FOR_ROTATION_START 600 // degrees/sec
+#define ANGLE_CHECK_RANGE 3
+#define ANGLE_CHECK_STRIDE 1
+#define DISTANCE_SENSOR_RELATIVE_WEIGHT 1
+
+#define BEACON_DISTANCE 20
 // ==========================================================================================
 
 std::vector<int> howManyTimesEachAngleWasMeasured(360, 0);
 std::vector<int> mapping(360, 0);
 int howManyAnglesAreDone = 0;
 
-queue<int> samplesBuffer;
-
 MPU6050 mpu = MPU6050(Wire);
 
-double getGyroYaw();
-double getGyroYaw(bool useOffset);
-int getLunaDistance();
-void updateLunaDistance();
-std::vector<int> linspace(double start, double end, int numPoints);
-void initSamplesBuffer();
-void pushSampleToQueue(int distance);
-int scalarDifference(vector<int> vec, queue<int> que);
+bool performMapping();
+bool updateLunaDistance();
+bool updateAllData();
 int estimateCurrentAngle();
 
 void addVectorToLogFile(string dataName, const std::vector<int> &vec);
@@ -60,11 +57,26 @@ void readFile(fs::FS &fs, const char *path);
 void appendFile(fs::FS &fs, const char *path, const char *message);
 void deleteFile(fs::FS &fs, const char *path);
 std::string vectorToString(const std::vector<int> &vec);
-void printVector(const std::vector<int> &vec);
 
 void setup()
 {
-    Serial.begin(115200); // Communication with host
+    Serial.begin(115200);  // Communication with host
+    Serial2.begin(115200); // Communication with TF-Luna
+    Wire.begin();          // For I2C
+
+    // Initialize LED ports
+    // ------------------------------------------------------------------------------------------
+    pinMode(LED_PIN, OUTPUT);
+    pinMode(BUILT_IN_LED, OUTPUT);
+    // ==========================================================================================
+
+    // wait until serial port opens for native USB devices
+    // ------------------------------------------------------------------------------------------
+    while (!Serial)
+    {
+        delay(1);
+    }
+    // ==========================================================================================
 
     // Initialize SPIFFS
     // ==========================================================================================
@@ -73,22 +85,14 @@ void setup()
         Serial.println("SPIFFS Mount Failed");
         return;
     }
-    readFile(SPIFFS, "/log.txt");
+    if (SHOULD_PRINT_PREV_LOG_ON_BOOT)
+    {
+        readFile(SPIFFS, "/log.txt");
+    }
     // // ==========================================================================================
 
-    Serial2.begin(115200); // Communication with TF-Luna
-    Wire.begin();          // For I2C
-    pinMode(LED_PIN, OUTPUT);
-    pinMode(BUILT_IN_LED, OUTPUT);
-
-    // wait until serial port opens for native USB devices
-    while (!Serial)
-    {
-        delay(1);
-    }
-
     // Boot MPU6050
-    // ==========================================================================================
+    // ------------------------------------------------------------------------------------------
     byte status = mpu.begin(3, 3);
     Serial.print(F("MPU6050 status: "));
     Serial.println(status);
@@ -105,209 +109,229 @@ void setup()
     Serial.println(F("Done!\n"));
     // ==========================================================================================
 
+    // Initialize TF-Luna
+    // ------------------------------------------------------------------------------------------
     char freq_packet[] = {0x5A, 0x06, 0x03, 0xFA, 0x00, 0x00}; // set TF-Luna freq to 250 Hz (0xFA=0d250)
     Serial2.write(freq_packet, (size_t)6);
+    // ==========================================================================================
 
+    // Default state for LEDs
+    // ------------------------------------------------------------------------------------------
     digitalWrite(BUILT_IN_LED, HIGH);
     digitalWrite(LED_PIN, HIGH);
+    // ==========================================================================================
 }
 
-double currentAngleZOffset = 0;
+enum CurrentState
+{
+    state_mapping,
+    state_waiting_to_rotate,
+    state_rotating_and_recording,
+    state_done
+};
 
-bool mappingCompletedFlag = true;
-unsigned long prevMillisOfDistanceSample = 0;
-unsigned long prevMillisOfMapping = 0;
+vector<int> timestampsVector;                     // stores timestamps of algo runs. Units: micro-seconds
+vector<int> distancesVector;                      // stores distances from TF-Luna samples. Units: cm
+vector<int> gyroZVector;                          // stores angular velocity reads from gyro. Units: degrees/second.
+vector<int> angleStepsVector;                     // stores sizes of angular step since last measurment. How many degrees has the system passed since last time. Units: degrees.
+vector<int> estimatedAngleMainAlgoVectorForLog;   // stores the estimated angle as computed by the main algorithm. Units: whole degrees [0-359]
+vector<int> estimatedAngleBeaconAlgoVectorForLog; // stores the estimated angle as computed by the beacon algorithm. Units: whole degrees [0-359]
+vector<int> estimatedAngleNoAlgoVectorForLog;     // stores the estimated angle just as an integral on gyroZ. Units: whole degrees [0-359]
 
-vector<int> timestampVectorForLog;
-vector<int> distanceVectorForLog;
-vector<int> gyroZVectorForLog;
-vector<int> estimatedAngleMainAlgoVectorForLog;
-vector<int> estimatedAngleBeaconAlgoVectorForLog;
+unsigned long rotationStartTimestamp;
+unsigned long currentTimestamp;
+unsigned long lastTimestamp;
+int currentLunaDistance;
+float currentGyroZ;
+float currentNormalizedAngleZ;
+float currentNormalizedAngleZWithOffset;
+float currentAngleStep;
+CurrentState currentState = state_mapping;
 
-int rotationStartTimestamp = 0;
-bool wasRotationSaved = false;
-
-int currentEstimatedAngle = 0;
-
-bool hasBegunRotation = false;
+float currentAngleZOffset = 0;
 
 void loop()
 {
-    mpu.update();
-    updateLunaDistance();
+    if (!updateAllData())
+    {
+        return; // Don't do anything if there isn't a new distance sample available
+    }
 
-    if (howManyAnglesAreDone < 360 && IS_ALGORITHM_USED)
+    switch (currentState)
+    {
+    case state_mapping:
+        if (!IS_ALGORITHM_USED || performMapping())
+        {
+            currentState = state_waiting_to_rotate;
+        }
+        break;
+    case state_waiting_to_rotate:
+        if (currentGyroZ >= GYROZ_THRESHOLD_FOR_ROTATION_START)
+        {
+            deleteFile(SPIFFS, "/log.txt");
+            rotationStartTimestamp = currentTimestamp;
+            Serial.println("Logging started");
+            digitalWrite(BUILT_IN_LED, LOW);
+
+            currentState = state_rotating_and_recording;
+        }
+        break;
+    case state_rotating_and_recording:
+        if (currentLunaDistance <= BEACON_DISTANCE)
+        {
+            currentAngleZOffset = currentNormalizedAngleZ;
+        }
+
+        timestampsVector.push_back((currentTimestamp - rotationStartTimestamp) / 1000);
+        distancesVector.push_back(currentLunaDistance);
+        gyroZVector.push_back(currentGyroZ);
+        angleStepsVector.push_back(currentAngleStep);
+        estimatedAngleBeaconAlgoVectorForLog.push_back(currentNormalizedAngleZWithOffset);
+        estimatedAngleNoAlgoVectorForLog.push_back(currentNormalizedAngleZ);
+
+        int currentEstimatedAngle;
+        if (IS_ALGORITHM_USED)
+        {
+            currentEstimatedAngle = estimateCurrentAngle();
+            estimatedAngleMainAlgoVectorForLog.push_back(currentEstimatedAngle);
+        }
+        else
+        {
+            currentEstimatedAngle = currentNormalizedAngleZWithOffset;
+        }
+
+        if (currentEstimatedAngle <= 10 || currentEstimatedAngle >= 350)
+        {
+            digitalWrite(LED_PIN, LOW); // Since the LED is connect in a sink configuration, setting the port to LOW means turning it on
+        }
+        else
+        {
+            digitalWrite(LED_PIN, HIGH);
+        }
+
+        if (micros() - rotationStartTimestamp >= 10000000) // stop saving data after 10 seconds
+        {
+            digitalWrite(BUILT_IN_LED, HIGH);
+
+            addVectorToLogFile("Mapping", mapping);
+            addVectorToLogFile("Timestamps", timestampsVector);
+            addVectorToLogFile("Distances", distancesVector);
+            addVectorToLogFile("GyroZ", gyroZVector);
+            addVectorToLogFile("Estimated Angle Main Algo", estimatedAngleMainAlgoVectorForLog);
+            addVectorToLogFile("Estimated Angle Beacon Algo", estimatedAngleBeaconAlgoVectorForLog);
+            addVectorToLogFile("Estimated Angle No Algo", estimatedAngleNoAlgoVectorForLog);
+
+            Serial.println("Logging ended");
+
+            currentState = state_done;
+        }
+        break;
+    case state_done:
+        break;
+    }
+}
+
+// returns true when mapping is done
+bool performMapping()
+{
+    if (howManyAnglesAreDone < 360)
     {
         if (howManyAnglesAreDone >= 5)
         {
             digitalWrite(BUILT_IN_LED, LOW);
         }
-        if (millis() - prevMillisOfMapping >= (1000 / TF_LUNA_FREQ))
+
+        Serial.print("Current size of mapping: ");
+        Serial.println(howManyAnglesAreDone);
+
+        if (howManyTimesEachAngleWasMeasured.at(int(currentNormalizedAngleZ)) < MAPPING_BUFFER_SIZE)
         {
-            // Serial.print("TF-Luna distance(cm) = ");
-            // Serial.println(getLunaDistance());
-
-            // Serial.print("Gyro yaw (degrees) = ");
-            // Serial.println(getGyroYaw());
-
-            Serial.print("Current size of mapping: ");
-            Serial.println(howManyAnglesAreDone);
-
-            int currentAngle = int(getGyroYaw());
-
-            if (howManyTimesEachAngleWasMeasured.at(currentAngle) < 3)
+            mapping.at(int(currentNormalizedAngleZ)) += currentLunaDistance;
+            if (++howManyTimesEachAngleWasMeasured.at(int(currentNormalizedAngleZ)) == MAPPING_BUFFER_SIZE)
             {
-                mapping.at(currentAngle) += getLunaDistance();
-                if (++howManyTimesEachAngleWasMeasured.at(currentAngle) == 3)
-                {
-                    howManyAnglesAreDone++;
-                }
+                howManyAnglesAreDone++;
             }
-
-            prevMillisOfMapping = millis();
         }
     }
-    else if (mappingCompletedFlag && IS_ALGORITHM_USED)
+    else
     {
         vector<int>::iterator iter = mapping.begin();
 
         for (iter; iter < mapping.end(); iter++)
         {
-            (*iter) /= 5;
+            (*iter) /= MAPPING_BUFFER_SIZE;
         }
 
-        mappingCompletedFlag = false;
         digitalWrite(BUILT_IN_LED, HIGH);
-        initSamplesBuffer();
+
+        return true;
     }
-    else if (!hasBegunRotation && IS_ALGORITHM_USED)
-    {
-        hasBegunRotation = mpu.getGyroZ() >= GYROZ_THRESHOLD_FOR_ROTATION_START;
-
-        if (hasBegunRotation)
-        {
-            deleteFile(SPIFFS, "/log.txt");
-            rotationStartTimestamp = millis();
-            Serial.println("Logging started");
-            digitalWrite(BUILT_IN_LED, LOW);
-        }
-    }
-    else if ((millis() - prevMillisOfDistanceSample) >= (1000 / TF_LUNA_FREQ))
-    {
-        if (getLunaDistance() < 20)
-        {
-            currentAngleZOffset += getGyroYaw(true);
-        }
-
-        if (IS_ALGORITHM_USED)
-        {
-            pushSampleToQueue(getLunaDistance());
-            if ((millis() - rotationStartTimestamp) >= SETTLE_TIME)
-            {
-                // int tempTime = millis();
-                currentEstimatedAngle = estimateCurrentAngle();
-                // Serial.print("Angle estimation took: ");
-                // Serial.print(millis() - tempTime);
-                // Serial.println("[ms]");
-                if (((currentEstimatedAngle >= 0 && currentEstimatedAngle <= 20 && IS_ALGORITHM_USED) || (getGyroYaw(true) >= 0 && getGyroYaw(true) <= 20 && !IS_ALGORITHM_USED)) && hasBegunRotation)
-                {
-                    digitalWrite(LED_PIN, LOW); // Since the LED is connect in a sink configuration, setting the port to LOW means turning it on
-                }
-                else
-                {
-                    digitalWrite(LED_PIN, HIGH);
-                }
-                // Serial.print("CurrentEstimatedAngle = ");
-                // Serial.println(currentEstimatedAngle);
-            }
-        }
-
-        if (millis() - rotationStartTimestamp < 10000) // Save data for 10 seconds
-        {
-            timestampVectorForLog.push_back(millis() - rotationStartTimestamp);
-            distanceVectorForLog.push_back(getLunaDistance());
-            gyroZVectorForLog.push_back(mpu.getGyroZ());
-            estimatedAngleMainAlgoVectorForLog.push_back(currentEstimatedAngle);
-            estimatedAngleBeaconAlgoVectorForLog.push_back(getGyroYaw(true));
-        }
-        else if (!wasRotationSaved)
-        {
-            digitalWrite(BUILT_IN_LED, HIGH);
-
-            wasRotationSaved = true;
-            addVectorToLogFile("Mapping", mapping);
-            addVectorToLogFile("Timestamps", timestampVectorForLog);
-            addVectorToLogFile("Distances", distanceVectorForLog);
-            addVectorToLogFile("GyroZ", gyroZVectorForLog);
-            addVectorToLogFile("Estimated Angle Main Algo", estimatedAngleMainAlgoVectorForLog);
-            addVectorToLogFile("Estimated Angle Beacon Algo", estimatedAngleBeaconAlgoVectorForLog);
-
-            Serial.println("Logging ended");
-        }
-
-        prevMillisOfDistanceSample = millis();
-    }
+    return false;
 }
 
-std::vector<int> linspace(double start, double end, int numPoints)
+// returns true if new distance sample is available
+bool updateAllData()
 {
-    std::vector<int> result;
+    bool output;
 
-    double step = (end - start) / (numPoints - 1);
-    double value = start;
+    mpu.update();
 
-    for (int i = 0; i < numPoints; ++i)
+    currentTimestamp = micros();
+
+    currentGyroZ = mpu.getGyroZ();
+
+    currentNormalizedAngleZ = mpu.getAngleZ();
+    currentNormalizedAngleZ = fmod(currentNormalizedAngleZ, 360.0);
+    if (currentNormalizedAngleZ < 0)
     {
-        result.push_back(int(value));
-        value += step;
+        currentNormalizedAngleZ += 360.0;
     }
 
-    return result;
-}
-
-void initSamplesBuffer()
-{
-    for (size_t i = 0; i < SAMPLE_BUFFER_SIZE; i++)
+    currentNormalizedAngleZWithOffset = currentNormalizedAngleZ - currentAngleZOffset;
+    currentNormalizedAngleZWithOffset = fmod(currentNormalizedAngleZWithOffset, 360.0);
+    if (currentNormalizedAngleZWithOffset < 0)
     {
-        samplesBuffer.push(0);
-    }
-}
-
-void pushSampleToQueue(int distance)
-{
-    samplesBuffer.pop();
-    samplesBuffer.push(distance);
-}
-
-int scalarDifference(vector<int> vec, queue<int> que)
-{
-    int result = 0;
-
-    for (auto it = vec.begin(); it != vec.end(); ++it)
-    {
-        result += abs(*it - que.front());
-        que.pop();
+        currentNormalizedAngleZWithOffset += 360.0;
     }
 
-    return result;
+    output = updateLunaDistance(); // updates currentLunaDistance variable
+
+    currentAngleStep = ((currentTimestamp - lastTimestamp) * currentGyroZ) / 1000000.0;
+
+    lastTimestamp = currentTimestamp;
+
+    return output;
 }
 
 bool isFirstTimeEstimating = true;
-unsigned long previousEstimationTimestamp = 0;
 int previousEstimatedAngle = 0;
+unsigned long previousEstimationTimestamp = 0;
 int estimateCurrentAngle()
 {
+    // Wait for rotation to stabilize
+    if (currentTimestamp - rotationStartTimestamp <= SETTLE_TIME * 1000000)
+    {
+        return 0;
+    }
+
     int currentEstimatedAngleBasedOnSpeedPropagation = 0;
     if (!isFirstTimeEstimating)
     {
-        currentEstimatedAngleBasedOnSpeedPropagation = (int(previousEstimatedAngle + ((millis() - previousEstimationTimestamp) / 1000.0) * mpu.getGyroZ())) % 360;
+        currentEstimatedAngleBasedOnSpeedPropagation = (int(previousEstimatedAngle + ((currentTimestamp - previousEstimationTimestamp) / 1000000.0) * currentGyroZ)) % 360;
     }
-    previousEstimationTimestamp = millis();
+    previousEstimationTimestamp = currentTimestamp;
 
     int currentMinDifference = INT_MAX;
     int currentEstimatedAngle = -1;
     double sizeOfEachSampleStep = (mpu.getGyroZ() / TF_LUNA_FREQ); // in degrees
-    vector<int> angles = linspace(0, (SAMPLE_BUFFER_SIZE - 1) * sizeOfEachSampleStep, SAMPLE_BUFFER_SIZE);
+    size_t angleStepsVectorSize = angleStepsVector.size();
+    vector<int> angles;
+    angles.push_back(0);
+
+    for (size_t i = SAMPLE_BUFFER_SIZE - 1; i > 0; i--)
+    {
+        angles.push_back(angleStepsVector.at(angleStepsVectorSize - i));
+    }
 
     int initialI, maxI, strideI;
     if (isFirstTimeEstimating)
@@ -324,9 +348,10 @@ int estimateCurrentAngle()
         maxI = currentEstimatedAngleBasedOnSpeedPropagation + ANGLE_CHECK_RANGE - angles.back();
         strideI = ANGLE_CHECK_STRIDE;
     }
+
     for (int i = initialI; i < maxI; i += strideI)
     {
-        vector<int> GT_distances;
+        vector<int> GT_distances; // GT stands for ground truth
 
         int tempCurrentEstimatedAngle;
         for (int angle : angles)
@@ -336,10 +361,16 @@ int estimateCurrentAngle()
             GT_distances.push_back(GT_distance);
         }
 
-        int difference = scalarDifference(GT_distances, samplesBuffer);
-        if (difference <= currentMinDifference)
+        int currentDifference = 0;
+        size_t distancesVectorSize = distancesVector.size();
+        for (size_t i = 0; i < SAMPLE_BUFFER_SIZE; i++)
         {
-            currentMinDifference = difference;
+            currentDifference += abs(GT_distances.at(i) - distancesVector.at(distancesVectorSize - 1 - i));
+        }
+
+        if (currentDifference <= currentMinDifference)
+        {
+            currentMinDifference = currentDifference;
             currentEstimatedAngle = tempCurrentEstimatedAngle;
         }
     }
@@ -349,11 +380,11 @@ int estimateCurrentAngle()
     {
         if (currentEstimatedAngle < currentEstimatedAngleBasedOnSpeedPropagation)
         {
-            currentEstimatedAngle = (int) (DISTANCE_SENSOR_RELATIVE_WEIGHT * (currentEstimatedAngle + 360) + (1 - DISTANCE_SENSOR_RELATIVE_WEIGHT) * currentEstimatedAngleBasedOnSpeedPropagation) % 360;
+            currentEstimatedAngle = (int)(DISTANCE_SENSOR_RELATIVE_WEIGHT * (currentEstimatedAngle + 360) + (1 - DISTANCE_SENSOR_RELATIVE_WEIGHT) * currentEstimatedAngleBasedOnSpeedPropagation) % 360;
         }
         else
         {
-            currentEstimatedAngle = (int) (DISTANCE_SENSOR_RELATIVE_WEIGHT * currentEstimatedAngle + (1 - DISTANCE_SENSOR_RELATIVE_WEIGHT) * (currentEstimatedAngleBasedOnSpeedPropagation + 360)) % 360;
+            currentEstimatedAngle = (int)(DISTANCE_SENSOR_RELATIVE_WEIGHT * currentEstimatedAngle + (1 - DISTANCE_SENSOR_RELATIVE_WEIGHT) * (currentEstimatedAngleBasedOnSpeedPropagation + 360)) % 360;
         }
     }
     else
@@ -361,119 +392,40 @@ int estimateCurrentAngle()
         currentEstimatedAngle = DISTANCE_SENSOR_RELATIVE_WEIGHT * currentEstimatedAngle + (1 - DISTANCE_SENSOR_RELATIVE_WEIGHT) * currentEstimatedAngleBasedOnSpeedPropagation;
     }
     previousEstimatedAngle = currentEstimatedAngle;
+
     return currentEstimatedAngle;
 }
 
-double getGyroYaw()
+bool updateLunaDistance() // Returns true if new reading was successfully read, otherwise returns false
 {
-    return getGyroYaw(false);
-}
+    bool output = false;
 
-double getGyroYaw(bool useOffset)
-{
-    float angleZ = mpu.getAngleZ();
-    angleZ = fmod(angleZ - (currentAngleZOffset * useOffset), 360.0);
-    if (angleZ < 0)
+    uint8_t buffer[256];
+    unsigned char check = 0;
+
+    size_t howMuchRead = Serial2.read(buffer, 256);
+    for (size_t packet_i = 1; packet_i <= (howMuchRead / 9); packet_i++)
     {
-        angleZ += 360.0;
-    }
-    return angleZ;
-}
+        uint8_t *packet = buffer + howMuchRead - 9 * packet_i;
 
-unsigned char check;
-unsigned char uart[9];      /*----save data measured by LiDAR-------------*/
-int rec_debug_state = 0x01; // receive state for frame
-int lunaDistance;
-void updateLunaDistance()
-{
-    if (Serial2.available()) // check if serial port has data input
-    {
-        if (rec_debug_state == 0x01)
-        { // the first byte
-            uart[0] = Serial2.read();
-            if (uart[0] == 0x59)
-            {
-                check = uart[0];
-                rec_debug_state = 0x02;
-            }
-        }
-        else if (rec_debug_state == 0x02)
-        { // the second byte
-            uart[1] = Serial2.read();
-            if (uart[1] == 0x59)
-            {
-                check += uart[1];
-                rec_debug_state = 0x03;
-            }
-            else
-            {
-                rec_debug_state = 0x01;
-            }
+        for (size_t i = 0; i <= 7; i++)
+        {
+            check += packet[i];
         }
 
-        else if (rec_debug_state == 0x03)
+        if (packet[0] == 0x59 && packet[1] == 0x59 && packet[8] == check)
         {
-            uart[2] = Serial2.read();
-            check += uart[2];
-            rec_debug_state = 0x04;
-        }
-        else if (rec_debug_state == 0x04)
-        {
-            uart[3] = Serial2.read();
-            check += uart[3];
-            rec_debug_state = 0x05;
-        }
-        else if (rec_debug_state == 0x05)
-        {
-            uart[4] = Serial2.read();
-            check += uart[4];
-            rec_debug_state = 0x06;
-        }
-        else if (rec_debug_state == 0x06)
-        {
-            uart[5] = Serial2.read();
-            check += uart[5];
-            rec_debug_state = 0x07;
-        }
-        else if (rec_debug_state == 0x07)
-        {
-            uart[6] = Serial2.read();
-            check += uart[6];
-            rec_debug_state = 0x08;
-        }
-        else if (rec_debug_state == 0x08)
-        {
-            uart[7] = Serial2.read();
-            check += uart[7];
-            rec_debug_state = 0x09;
-        }
-        else if (rec_debug_state == 0x09)
-        {
-            uart[8] = Serial2.read();
-            if (uart[8] == check)
+
+            int tempDistance(packet[2] + packet[3] * 256);
+            if (tempDistance < 800 && tempDistance > 0)
             {
-                int tempDistance(uart[2] + uart[3] * 256);
-                if (tempDistance < 800 && tempDistance > 0)
-                {                                // max theoretical distance
-                    lunaDistance = tempDistance; // the distance
-                }
-                // strength = uart[4] + uart[5] * 256;   // the strength
-                // temprature = uart[6] + uart[7] * 256; // calculate chip temprature
-                // temprature = temprature / 8 - 256;
-                while (Serial2.available())
-                {
-                    Serial2.read();
-                } // This part is added becuase some previous packets are there in the buffer so to clear serial buffer and get fresh data.
-                  // delay(100);
+                currentLunaDistance = tempDistance; // the distance
+                return true;
             }
-            rec_debug_state = 0x01;
         }
     }
-}
 
-int getLunaDistance()
-{
-    return lunaDistance;
+    return false;
 }
 
 void addVectorToLogFile(string dataName, const std::vector<int> &vec)
@@ -547,14 +499,4 @@ std::string vectorToString(const std::vector<int> &vec)
         oss << elem << ' ';
     }
     return oss.str();
-}
-
-void printVector(const std::vector<int> &vec)
-{
-    for (int element : vec)
-    {
-        Serial.print(element);
-        Serial.print(" ");
-    }
-    Serial.println("");
 }
