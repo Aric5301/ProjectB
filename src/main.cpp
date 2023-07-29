@@ -21,8 +21,6 @@ using namespace std;
 #define RXD2 16
 #define TXD2 17
 
-#define TF_LUNA_FREQ 250 // in Hz
-
 // Algorithm parameters:
 
 // change this to choose whether you want the main algorithm active or only the beacon algorithm active.
