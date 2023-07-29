@@ -323,7 +323,6 @@ int estimateCurrentAngle()
 
     int currentMinDifference = INT_MAX;
     int currentEstimatedAngle = -1;
-    double sizeOfEachSampleStep = (mpu.getGyroZ() / TF_LUNA_FREQ); // in degrees
     size_t angleStepsVectorSize = angleStepsVector.size();
     vector<int> angles;
     angles.push_back(0);
