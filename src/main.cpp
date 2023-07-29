@@ -315,7 +315,7 @@ int estimateCurrentAngle()
     int currentEstimatedAngleBasedOnSpeedPropagation = 0;
     if (!isFirstTimeEstimating)
     {
-        currentEstimatedAngleBasedOnSpeedPropagation = (int(previousEstimatedAngle + ((currentTimestamp - previousEstimationTimestamp) / 1000000.0) * currentGyroZ)) % 360;
+        currentEstimatedAngleBasedOnSpeedPropagation = (int(previousEstimatedAngle + currentAngleStep) % 360;
     }
     previousEstimationTimestamp = currentTimestamp;
 
