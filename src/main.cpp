@@ -24,7 +24,7 @@ using namespace std;
 // Algorithm parameters:
 
 // change this to choose whether you want the main algorithm active or only the beacon algorithm active.
-#define IS_ALGORITHM_USED true
+#define IS_FUSION_ALGORITHM_USED true
 
 #define SHOULD_PRINT_PREV_LOG_ON_BOOT true
 
@@ -158,7 +158,7 @@ void loop()
     switch (currentState)
     {
     case state_mapping:
-        if (!IS_ALGORITHM_USED || performMapping())
+        if (!IS_FUSION_ALGORITHM_USED || performMapping())
         {
             currentState = state_waiting_to_rotate;
         }
@@ -188,7 +188,7 @@ void loop()
         estimatedAngleNoAlgoVectorForLog.push_back(currentNormalizedAngleZ);
 
         int currentEstimatedAngle;
-        if (IS_ALGORITHM_USED)
+        if (IS_FUSION_ALGORITHM_USED)
         {
             currentEstimatedAngle = estimateCurrentAngle();
             estimatedAngleMainAlgoVectorForLog.push_back(currentEstimatedAngle);
